@@ -15,16 +15,13 @@
 //!
 //! # Lifecycle
 //!
-//! 1. Call `start(interval_ns)` once from the main thread. This installs the
-//!    SIGPROF handler.
-//! 2. Each thread that wants to be profiled calls `register_thread()` from
-//!    its own context. This creates the per-thread timer and arms it.
-//! 3. On thread exit, call `unregister_thread()` to delete the timer.
-//! 4. Pause/resume: `disable()` clears RUNNING but leaves timers armed, so
-//!    `enable()` can re-enable sampling.
-//! 5. Teardown: `disable_permanent()` (called from `CtimerSampler::drop`) sets
-//!    a permanent-stop flag, each thread's next SIGPROF self-disarms its
-//!    timer.
+//! 1. Call `start(interval_ns)` once in the main thread to install the SIGPROF handler.
+//! 2. Each thread calls `register_thread` from its own context to arm a per-thread
+//!    timer, and `unregister_thread` (same thread) to tear it down.
+//! 3. `disable` and `enable` pause sampling without disarming the timers, so resuming
+//!    doesn't require re-registration.
+//! 4. Teardown: `disarm_all_timers` disarms timers globally (called automatically on
+//!    `CtimerSampler` drop). A subsequent `start` is required to sample again.
 
 use std::cell::Cell;
 use std::io;
@@ -38,7 +35,7 @@ static INTERVAL_NS: AtomicI64 = AtomicI64::new(0);
 /// Whether sampling is currently enabled. Toggled by `disable`/`enable`.
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// One-way flag to tell the signal handler to self-disarm each thread's timer.
-static PERMANENTLY_STOPPED: AtomicBool = AtomicBool::new(false);
+static DISARM_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static THREAD_TIMER: Cell<Option<libc::timer_t>> = const { Cell::new(None) };
@@ -77,7 +74,7 @@ pub unsafe fn start(
     }
 
     INTERVAL_NS.store(interval_ns, Ordering::Release);
-    PERMANENTLY_STOPPED.store(false, Ordering::Release);
+    DISARM_REQUESTED.store(false, Ordering::Release);
     RUNNING.store(true, Ordering::Release);
     Ok(())
 }
@@ -93,11 +90,10 @@ pub fn enable() {
     RUNNING.store(true, Ordering::Release);
 }
 
-/// Permanently disable sampling. Sets both flags so the handler self-disarms
-/// each thread's timer on its next tick. Not reversible; a subsequent `start`
-/// is required to sample again.
-pub fn disable_permanent() {
-    PERMANENTLY_STOPPED.store(true, Ordering::Release);
+/// Requests that all timers are disarmed.
+/// A subsequent `start` is required to sample again.
+pub fn disarm_all_timers() {
+    DISARM_REQUESTED.store(true, Ordering::Release);
     RUNNING.store(false, Ordering::Release);
 }
 
@@ -105,8 +101,8 @@ pub fn is_running() -> bool {
     RUNNING.load(Ordering::Acquire)
 }
 
-pub fn is_permanently_stopped() -> bool {
-    PERMANENTLY_STOPPED.load(Ordering::Acquire)
+pub fn is_disarm_requested() -> bool {
+    DISARM_REQUESTED.load(Ordering::Acquire)
 }
 
 pub fn interval_ns() -> i64 {
@@ -182,6 +178,8 @@ pub fn register_thread() -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Disarm and delete the calling thread's timer. Must run on the thread being
+/// unregistered. No-op if never registered.
 pub fn unregister_thread() {
     THREAD_TIMER.with(|c| {
         if let Some(t) = c.take() {
@@ -206,6 +204,12 @@ pub fn unregister_thread() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    // Serializes tests touching process-global state: RUNNING,
+    // DISARM_REQUESTED, INTERVAL_NS, and the SIGPROF handler.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     extern "C" fn dummy_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
 
@@ -223,6 +227,7 @@ mod tests {
 
     #[test]
     fn register_thread_fails_when_not_running() {
+        let _g = TEST_LOCK.lock().unwrap();
         RUNNING.store(false, Ordering::Release);
         let err = register_thread().unwrap_err();
         assert!(err.to_string().contains("not running"));
@@ -233,5 +238,57 @@ mod tests {
         THREAD_TIMER.with(|c| c.set(None));
         unregister_thread();
         assert!(THREAD_TIMER.with(|c| c.get()).is_none());
+    }
+
+    static SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn counting_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn thread_cpu_time_ns() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    fn burn_cpu(duration_ns: u64) {
+        let deadline = thread_cpu_time_ns() + duration_ns;
+        let mut acc: u64 = 0;
+        while thread_cpu_time_ns() < deadline {
+            for i in 0..10_000u64 {
+                acc = acc.wrapping_add(i);
+            }
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn register_thread_fires_samples_under_cpu_load() {
+        let _g = TEST_LOCK.lock().unwrap();
+        SAMPLE_COUNT.store(0, Ordering::Relaxed);
+
+        // ~1000 samples/sec.
+        unsafe { start(1_000_000, counting_handler) }.expect("start");
+        register_thread().expect("should register thread");
+
+        // 200ms of CPU => expect ~200 samples.
+        burn_cpu(200_000_000);
+
+        let count = SAMPLE_COUNT.load(Ordering::Relaxed);
+
+        unregister_thread();
+
+        RUNNING.store(false, Ordering::Release);
+        DISARM_REQUESTED.store(false, Ordering::Release);
+
+        // lower threshold to account for noise
+        assert!(
+            count >= 150,
+            "expected >=150 samples from 200ms of CPU at 1kHz, got {count}"
+        );
     }
 }

@@ -56,20 +56,7 @@ fn open_perf_event(attr: &mut perf_event_attr, pid: i32, cpu: i32) -> io::Result
         )
     };
     if fd < 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::PermissionDenied {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "perf_event_open denied ({}); for context-switch sampling \
-                     /proc/sys/kernel/perf_event_paranoid must be <= 1 \
-                     (current value can be checked with: \
-                     cat /proc/sys/kernel/perf_event_paranoid)",
-                    err
-                ),
-            ));
-        }
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
 
     let base = unsafe {
@@ -255,9 +242,8 @@ impl PerfSamplerImpl {
                 0
             };
 
-        // Use CLOCK_MONOTONIC so perf timestamps are in the same clock domain
-        // as Rust's `Instant::now()`. Without this, perf defaults to
-        // CLOCK_MONOTONIC_RAW which drifts relative to CLOCK_MONOTONIC.
+        // Stamp samples with CLOCK_MONOTONIC so they share a clock with ctimer
+        // samples and `telemetry::events::clock_monotonic_ns()`.
         attr.set_use_clockid(1);
         attr.clockid = libc::CLOCK_MONOTONIC;
 
