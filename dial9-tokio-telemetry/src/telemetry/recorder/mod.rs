@@ -18,6 +18,7 @@ use crate::telemetry::writer::{RotatingWriter, TraceWriter};
 use metrique::timers::Timer;
 use metrique::unit::Microsecond;
 use metrique::unit_of_work::metrics;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,10 @@ thread_local! {
     /// Per-thread [`TelemetryHandle`], populated in `on_thread_start` and
     /// cleared in `on_thread_stop`. Enables [`TelemetryHandle::current`].
     static CURRENT_HANDLE: RefCell<Option<TelemetryHandle>> = const { RefCell::new(None) };
+
+    /// Set by `TelemetryHandle::spawn()` before calling `tokio::spawn()`,
+    /// so the `on_task_spawn` hook can distinguish instrumented from raw spawns.
+    static INSTRUMENTED_SPAWN: Cell<bool> = const { Cell::new(false) };
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +190,13 @@ fn register_hooks(
         builder.on_task_spawn(move |meta| {
             let task_id = TaskId::from(meta.id());
             let location = meta.spawned_at();
+            let instrumented = INSTRUMENTED_SPAWN.with(|f| f.get());
+
             s5.record_event(RawEvent::TaskSpawn {
                 timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
                 task_id,
                 location,
+                instrumented,
             });
         });
         let s6 = shared.clone();
@@ -399,10 +407,28 @@ impl TelemetryHandle {
         F::Output: Send + 'static,
     {
         let traced_handle = self.traced_handle();
+        let _guard = InstrumentedSpawnGuard::set();
         tokio::spawn(async move {
             let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
             crate::traced::Traced::new(future, traced_handle, task_id).await
         })
+    }
+}
+
+/// RAII guard that sets `INSTRUMENTED_SPAWN` to `true` on creation and
+/// resets it to `false` on drop, even if `tokio::spawn` panics.
+struct InstrumentedSpawnGuard;
+
+impl InstrumentedSpawnGuard {
+    fn set() -> Self {
+        INSTRUMENTED_SPAWN.set(true);
+        Self
+    }
+}
+
+impl Drop for InstrumentedSpawnGuard {
+    fn drop(&mut self) {
+        INSTRUMENTED_SPAWN.set(false);
     }
 }
 
@@ -428,6 +454,7 @@ impl RuntimeTelemetryHandle {
         F::Output: Send + 'static,
     {
         let traced = self.traced.clone();
+        let _guard = InstrumentedSpawnGuard::set();
         self.runtime.spawn(async move {
             let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
             crate::traced::Traced::new(future, traced, task_id).await
@@ -581,6 +608,7 @@ impl Drop for TelemetryGuard {
     fn drop(&mut self) {
         // 1. Stop the flush thread (flushes + finalizes)
         self.stop_flush_thread();
+
         // 2. Hard shutdown: drop the sender without sending — worker sees
         // RecvError and exits without draining. No need to join the thread.
         // For graceful drain, use graceful_shutdown() instead.
@@ -1484,6 +1512,7 @@ mod tests {
                     timestamp_nanos: (i as u64 + 1) * 1000,
                     task_id,
                     location: loc,
+                    instrumented: true,
                 },
                 &collector,
                 &drain_epoch,

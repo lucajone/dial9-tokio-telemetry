@@ -505,6 +505,21 @@
                 border: 1px solid rgba(255, 68, 68, 0.7);
                 color: #ff8a8a;
             }
+            a.uninstrumented-badge {
+                background: #3a1a1a;
+                border: 1px solid rgba(255, 68, 68, 0.5);
+                padding: 1px 4px;
+                border-radius: 2px;
+                font-size: 0.85em;
+                color: #ff8a8a;
+                text-decoration: none;
+                display: inline-block;
+                vertical-align: text-bottom;
+                cursor: pointer;
+            }
+            a.uninstrumented-badge:hover {
+                text-decoration: underline;
+            }
             #help-overlay {
                 display: none;
                 position: fixed;
@@ -573,6 +588,7 @@
                         <option value="long-poll">Long Polls (>1ms)</option>
                         <option value="cpu-sampled">Polls with CPU Samples</option>
                         <option value="wake-delay">Wake→Poll Delays (>100µs)</option>
+                        <option value="uninstrumented">Uninstrumented Polls</option>
                     </select>
                     <label style="display:flex;align-items:center;gap:4px;font-size:0.85em;cursor:pointer">
                         <input type="checkbox" id="sort-by-worst" style="cursor:pointer" checked>
@@ -583,6 +599,7 @@
                     <span id="poi-counter" style="font-size:0.85em;color:#888"></span>
                     <span style="width:1px;height:20px;background:#444;margin:0 8px"></span>
                     <button id="btn-sched-panel" style="background:#3a1a1a;border-color:#ff4444;color:#ff8a65">⚠ Blocking Calls</button>
+                    <button id="btn-uninstrumented-info" style="display:none;background:#1e2050;border-color:#6c63ff;color:#d0ccff;white-space:nowrap" title="Some tasks lack wake tracking — click for details">ⓘ Blind spawns</button>
                     <button id="btn-set-range" title="Set time range filter (reloads with only events in range)">Set Range</button>
                     <button id="btn-clear-range" title="Clear time range filter" style="display:none">Clear Range</button>
                     <button id="btn-reset">New File</button>
@@ -652,6 +669,7 @@
                 <div id="flamegraph-panel">
                     <div id="fg-container" style="flex:1;display:flex;flex-direction:column;overflow:hidden"></div>
                 </div>
+                <div id="uninstrumented-popup" style="display:none;position:fixed;background:#1a1a2e;border:1px solid #6c63ff;border-radius:8px;padding:12px 16px;z-index:200;max-width:700px;max-height:400px;overflow-y:auto;font-size:0.82em;line-height:1.6;box-shadow:0 4px 20px rgba(0,0,0,0.5);font-family:monospace"></div>
             </div>
             <div id="stack-sidebar">
                 <div class="sidebar-resize" id="sidebar-resize-handle"></div>
@@ -1454,6 +1472,16 @@
                     if (hasSchedEvents) break;
                 }
                 document.getElementById("btn-sched-panel").style.display = hasSchedEvents ? "" : "none";
+
+                // Show uninstrumented button if any tasks are flagged
+                const uninstrumentedCount = trace.taskInstrumented
+                    ? [...trace.taskInstrumented.values()].filter(v => !v).length
+                    : 0;
+                const btnUninst = document.getElementById("btn-uninstrumented-info");
+                btnUninst.style.display = uninstrumentedCount > 0 ? "" : "none";
+                if (uninstrumentedCount > 0) {
+                    btnUninst.textContent = `ⓘ Uninstrumented (${uninstrumentedCount})`;
+                }
                 showToast("shift-drag-hint", "⇧ Shift+drag to select a region", "info", 0, true);
                 showToast("option-drag-hint", "⌥ Option+drag to zoom", "info", 0, true);
                 requestAnimationFrame(renderAll);
@@ -1462,7 +1490,7 @@
             function updatePointsOfInterest() {
                 const filterType = document.getElementById("poi-filter").value;
                 const sortByWorst = document.getElementById("sort-by-worst").checked;
-                pointsOfInterest = filterPointsOfInterest(filterType, workerSpans, workerIds, schedDelays, { hasSchedWait: trace.hasSchedWait, sortByWorst });
+                pointsOfInterest = filterPointsOfInterest(filterType, workerSpans, workerIds, schedDelays, { hasSchedWait: trace.hasSchedWait, sortByWorst, taskInstrumented: trace.taskInstrumented });
                 currentPoiIndex = -1;
                 updatePoiCounter();
             }
@@ -2250,14 +2278,29 @@
                 const terminateTs = trace.taskTerminateTimes?.get(selectedTaskId);
                 const hasTerminate = terminateTs != null;
                 const spawnTs = trace.taskSpawnTimes?.get(selectedTaskId);
+                const isInstrumented = trace.taskInstrumented?.get(selectedTaskId) ?? true;
                 let lifecycleStr = "";
                 if (hasTerminate && spawnTs != null) {
                     const dur = terminateTs - spawnTs;
                     const durMs = dur / 1e6;
                     lifecycleStr = ` · lifetime ${formatHumanDuration(dur)}`;
                 }
-                document.getElementById("task-detail-label").textContent =
-                    `Task 0x${selectedTaskId.toString(16)}${loc ? " — " + loc : ""} · ${polls.length} polls · ${wakeCount} wakes${lifecycleStr}${hasTerminate ? " ✓" : ""}`;
+                const escapeHtml = (s) => String(s)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;");
+                let labelHtml = `Task 0x${selectedTaskId.toString(16)}`;
+                if (loc) labelHtml += ` — ${escapeHtml(loc)}`;
+                labelHtml += ` · ${polls.length} polls`;
+                if (isInstrumented) {
+                    labelHtml += ` · ${wakeCount} wakes`;
+                }
+                labelHtml += `${lifecycleStr}${hasTerminate ? " ✓" : ""}`;
+                if (!isInstrumented) {
+                    labelHtml += ` · <a class="uninstrumented-badge" href="https://docs.rs/dial9-tokio-telemetry/latest/dial9_tokio_telemetry/telemetry/struct.TelemetryHandle.html#method.spawn" target="_blank" title="Task spawned via raw tokio::spawn() — click for docs on TelemetryHandle::spawn">no wake data ⓘ</a>`;
+                }
+                document.getElementById("task-detail-label").innerHTML = labelHtml;
 
                 const parent = c.parentElement;
                 const dpr = devicePixelRatio || 1;
@@ -2754,6 +2797,9 @@
             document.getElementById("poi-filter").addEventListener("change", updatePointsOfInterest);
             document.getElementById("sort-by-worst").addEventListener("change", updatePointsOfInterest);
             document.getElementById("btn-sched-panel").addEventListener("click", showSchedPanel);
+            document.getElementById("btn-uninstrumented-info").addEventListener("click", (e) => {
+                showUninstrumentedPopup(e.target);
+            });
             document.getElementById("btn-prev-poi").addEventListener("click", () => {
                 if (currentPoiIndex > 0) jumpToPoi(currentPoiIndex - 1);
                 else if (currentPoiIndex < 0 && pointsOfInterest.length > 0) jumpToPoi(0);
@@ -3220,6 +3266,81 @@
 
             document.getElementById("stack-sidebar-close").addEventListener("click", hideStackPopup);
 
+            // ── Uninstrumented Tasks Popup ──
+            function showUninstrumentedPopup(anchor) {
+                if (!trace || !trace.taskInstrumented) return;
+                const popup = document.getElementById("uninstrumented-popup");
+
+                // Toggle off if already visible
+                if (popup.style.display !== "none") {
+                    popup.style.display = "none";
+                    return;
+                }
+
+                // Group by spawn location
+                const groups = new Map();
+                let total = 0;
+                for (const [taskId, instrumented] of trace.taskInstrumented) {
+                    if (instrumented) continue;
+                    total++;
+                    const loc = trace.taskSpawnLocs.get(taskId);
+                    const locStr = loc ? (trace.spawnLocations.get(loc) || loc) : "(unknown)";
+                    if (!groups.has(locStr)) groups.set(locStr, 0);
+                    groups.set(locStr, groups.get(locStr) + 1);
+                }
+
+                const sorted = [...groups.entries()].sort((a, b) => b[1] - a[1]);
+
+                let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">`;
+                html += `<span style="color:#6c63ff;font-weight:600">${total} uninstrumented task(s) at ${sorted.length} site(s)</span>`;
+                html += `<span id="uninstrumented-popup-close" style="cursor:pointer;color:#888;padding:0 4px">&times;</span>`;
+                html += `</div>`;
+                html += `<div style="color:#888;margin-bottom:8px;font-family:sans-serif;font-size:0.95em">No wake data — use the filter <b>Uninstrumented Polls</b> to navigate. <a href="https://docs.rs/dial9-tokio-telemetry/latest/dial9_tokio_telemetry/telemetry/struct.TelemetryHandle.html#method.spawn" target="_blank" style="color:#6c63ff">Docs →</a></div>`;
+
+                for (const [loc, count] of sorted) {
+                    // Try to build a docs.rs source link from the path
+                    const locEsc = loc.replace(/</g, "&lt;");
+                    const docsMatch = loc.match(/\/([a-z][a-z0-9_-]*)-(\d+\.\d+[^/]*)\/(.+\.rs)(?::(\d+))?/);
+                    let locHtml;
+                    if (docsMatch) {
+                        const [, crate_, version, rawPath, line] = docsMatch;
+                        const crateSrc = crate_.replace(/-/g, "_");
+                        const path = rawPath.replace(/^src\//, "");
+                        let url = `https://docs.rs/${crate_}/${version}/src/${crateSrc}/${path}.html`;
+                        if (line) url += `#${line}`;
+                        locHtml = `<a href="${url}" target="_blank" style="color:#ccc;text-decoration:underline dotted">${locEsc}</a>`;
+                    } else {
+                        locHtml = `<span style="color:#ccc">${locEsc}</span>`;
+                    }
+                    html += `<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px">`;
+                    html += `<span style="color:#d0ccff;font-weight:600;min-width:30px;text-align:right">${count}×</span>`;
+                    html += locHtml;
+                    html += `</div>`;
+                }
+
+                popup.innerHTML = html;
+
+                // Position below the button
+                const rect = anchor.getBoundingClientRect();
+                popup.style.top = (rect.bottom + 4) + "px";
+                popup.style.right = (window.innerWidth - rect.right) + "px";
+                popup.style.left = "auto";
+                popup.style.display = "block";
+
+                document.getElementById("uninstrumented-popup-close").addEventListener("click", () => {
+                    popup.style.display = "none";
+                });
+            }
+
+            // Close popup when clicking outside
+            document.addEventListener("click", (e) => {
+                const popup = document.getElementById("uninstrumented-popup");
+                const btn = document.getElementById("btn-uninstrumented-info");
+                if (popup.style.display !== "none" && !popup.contains(e.target) && e.target !== btn) {
+                    popup.style.display = "none";
+                }
+            });
+
             // ── Sidebar view tabs (poll-detail | flamegraph <-> blocking calls) ──
             function showSidebarTabs(activeTab) {
                 const tabs = document.getElementById("sidebar-tabs");
@@ -3580,7 +3701,9 @@
                             break;
                         }
                         clearToasts();
-                        if (document.getElementById("stack-sidebar").style.display === "flex") {
+                        if (document.getElementById("uninstrumented-popup").style.display !== "none") {
+                            document.getElementById("uninstrumented-popup").style.display = "none";
+                        } else if (document.getElementById("stack-sidebar").style.display === "flex") {
                             // If flamegraph is in the sidebar, let it handle Escape first
                             if (fgActive && fgInstance.handleEscape()) {
                                 break;

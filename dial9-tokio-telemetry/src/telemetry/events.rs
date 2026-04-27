@@ -133,6 +133,9 @@ pub enum TelemetryEvent {
         task_id: TaskId,
         /// Interned spawn location of the task.
         spawn_loc: InternedString,
+        /// Whether this task was spawned via [`TelemetryHandle::spawn`].
+        /// `None` for traces recorded before this field existed.
+        instrumented: Option<bool>,
     },
     /// A task terminated (completed or was cancelled).
     TaskTerminate {
@@ -319,6 +322,7 @@ pub(crate) enum RawEvent {
         timestamp_nanos: u64,
         task_id: crate::telemetry::task_metadata::TaskId,
         location: &'static std::panic::Location<'static>,
+        instrumented: bool,
     },
     TaskTerminate {
         timestamp_nanos: u64,
@@ -555,6 +559,7 @@ mod tests {
             timestamp_nanos: 5_000_000,
             task_id: TaskId::from_u32(1),
             spawn_loc: InternedString::from_raw(1),
+            instrumented: Some(true),
         };
         assert_eq!(task_spawn.timestamp_nanos(), Some(5_000_000));
     }
@@ -592,6 +597,7 @@ mod tests {
             timestamp_nanos: 5_000_000,
             task_id: TaskId::from_u32(1),
             spawn_loc: InternedString::from_raw(1),
+            instrumented: Some(true),
         };
         assert!(task_spawn.is_runtime_event());
     }
