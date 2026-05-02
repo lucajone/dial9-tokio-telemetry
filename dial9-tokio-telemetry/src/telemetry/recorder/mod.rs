@@ -89,7 +89,7 @@ fn flush_once(
     let cpu_events_time = std::time::Instant::now();
     #[cfg(feature = "cpu-profiling")]
     {
-        if shared.enabled.load(Ordering::Relaxed) {
+        if shared.is_enabled() {
             event_writer.flush_cpu(shared);
         }
     }
@@ -168,44 +168,56 @@ fn register_hooks(
 
     builder
         .on_thread_park(move || {
-            let event = make_worker_park(&c1, &s1);
-            s1.record_event(event);
+            s1.if_enabled(|buf| {
+                let event = make_worker_park(&c1, &s1);
+                buf.record_event(event);
+            });
         })
         .on_thread_unpark(move || {
-            let event = make_worker_unpark(&c2, &s2);
-            s2.record_event(event);
+            s2.if_enabled(|buf| {
+                let event = make_worker_unpark(&c2, &s2);
+                buf.record_event(event);
+            });
         })
         .on_before_task_poll(move |meta| {
-            let task_id = TaskId::from(meta.id());
-            let location = meta.spawned_at();
-            let event = make_poll_start(&c3, &s3, location, task_id);
-            s3.record_event(event);
+            s3.if_enabled(|buf| {
+                let task_id = TaskId::from(meta.id());
+                let location = meta.spawned_at();
+                let event = make_poll_start(&c3, &s3, location, task_id);
+                buf.record_event(event);
+            });
         })
         .on_after_task_poll(move |_meta| {
-            let event = make_poll_end(&c4, &s4);
-            s4.record_event(event);
+            s4.if_enabled(|buf| {
+                let event = make_poll_end(&c4, &s4);
+                buf.record_event(event);
+            });
         });
 
     if task_tracking_enabled {
         let s5 = shared.clone();
         builder.on_task_spawn(move |meta| {
-            let task_id = TaskId::from(meta.id());
-            let location = meta.spawned_at();
-            let instrumented = INSTRUMENTED_SPAWN.with(|f| f.get());
+            s5.if_enabled(|buf| {
+                let task_id = TaskId::from(meta.id());
+                let location = meta.spawned_at();
+                let instrumented = INSTRUMENTED_SPAWN.with(|f| f.get());
 
-            s5.record_event(RawEvent::TaskSpawn {
-                timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
-                task_id,
-                location,
-                instrumented,
+                buf.record_event(RawEvent::TaskSpawn {
+                    timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+                    task_id,
+                    location,
+                    instrumented,
+                });
             });
         });
         let s6 = shared.clone();
         builder.on_task_terminate(move |meta| {
-            let task_id = TaskId::from(meta.id());
-            s6.record_event(RawEvent::TaskTerminate {
-                timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
-                task_id,
+            s6.if_enabled(|buf| {
+                let task_id = TaskId::from(meta.id());
+                buf.record_event(RawEvent::TaskTerminate {
+                    timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+                    task_id,
+                });
             });
         });
     }
@@ -447,15 +459,20 @@ impl TelemetryHandle {
     }
 
     /// Record a user-defined [`Encodable`](crate::telemetry::buffer::Encodable) event.
+    ///
+    /// No-op on a disabled handle or when recording is paused.
     pub(crate) fn record_encodable_event(&self, event: &dyn crate::telemetry::buffer::Encodable) {
         if let Some(inner) = &self.inner {
-            inner.shared.record_encodable_event(event);
+            inner
+                .shared
+                .if_enabled(|buf| buf.record_encodable_event(event));
         }
     }
 
     /// Run a closure with direct access to the thread-local encoder.
     ///
-    /// No-op on a disabled handle.
+    /// The closure is only invoked if telemetry is enabled.
+    /// No-op on a disabled handle or when recording is paused.
     // TODO(GH-XXX): consider making this public as an alternative to record_event
     // for zero-copy dynamic schema encoding
     pub(crate) fn with_encoder(
@@ -463,7 +480,7 @@ impl TelemetryHandle {
         f: impl FnOnce(&mut crate::telemetry::buffer::ThreadLocalEncoder<'_>),
     ) {
         if let Some(inner) = &self.inner {
-            inner.shared.with_encoder(f);
+            inner.shared.if_enabled(|buf| buf.with_encoder(f));
         }
     }
 
@@ -1369,7 +1386,7 @@ fn run_flush_loop(
         // When disabled, skip all recording work (queue sampling, metadata
         // merging, drain coordination, flush). The loop still wakes every
         // 5ms to check for control commands and the exit signal.
-        if !exit && !shared.enabled.load(Ordering::Relaxed) {
+        if !exit && !shared.is_enabled() {
             continue;
         }
 
